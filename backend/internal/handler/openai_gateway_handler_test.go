@@ -2438,7 +2438,14 @@ func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t 
 
 	h.Responses(c)
 
-	require.Equal(t, []int64{9912, 9912}, upstream.calls())
+	// 三次上游调用 = 首次 + 1 次配置的同账号重试（pool_mode_retry_count=1）
+	// + 1 轮单账号等待重试。分组里只有 9912 一个号，被排除后选号必然落空；
+	// 与其立刻把 429 抛给客户端，不如等一会儿再试这个唯一的号
+	// （shouldWaitAndRetryLastAccount），上界由 MaxAccountSwitches=1 收敛。
+	//
+	// 注意等待轮不会重置 sameAccountRetryCount：pool_mode_retry_count 仍是
+	// 请求级预算，所以第二轮只打了一次，没有再来一次配置内重试。
+	require.Equal(t, []int64{9912, 9912, 9912}, upstream.calls())
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 	require.Equal(t, "1", rec.Header().Get("Retry-After"))
 	require.Equal(t, "rate_limit_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())

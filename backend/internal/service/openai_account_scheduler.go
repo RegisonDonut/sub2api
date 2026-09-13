@@ -1355,6 +1355,19 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 type openAISelectionFilterStats struct {
 	pool    int
 	reasons map[string]int
+	// orderReasons 记录候选进入选择序列之后、在终检阶段被逐个挡掉的原因。
+	// 初筛（reasons）与终检是两组完全不同的检查：初筛看的是快照里的静态资格，
+	// 终检会重新解析账号快照、复核 DB、校验代理隔离与调度阈值。历史上终检
+	// 一律静默 continue，于是「pool=1 且没有任何 filtered 计数，却仍然
+	// selection_order_exhausted」这种失败从错误串里完全看不出原因。
+	//
+	// 与 reasons 分开统计而不是合并：同一个 reason 在两个阶段含义不同
+	// （例如 runtime_blocked 出现在初筛说明快照里就是封的，出现在终检说明
+	// 是在本次选号过程中刚被并发请求打上的），混在一起会丢掉这个区分。
+	orderReasons map[string]int
+	// orderExamined 实际走到终检的候选次数。为 0 说明所有候选都被 probe budget
+	// 的分轮门挡在终检之前，这与「终检把候选全否了」是两种不同的故障。
+	orderExamined int
 }
 
 func (s *openAISelectionFilterStats) exclude(reason string) {
@@ -1362,6 +1375,21 @@ func (s *openAISelectionFilterStats) exclude(reason string) {
 		s.reasons = make(map[string]int, 4)
 	}
 	s.reasons[reason]++
+}
+
+// excludeOrder 记录一次终检阶段的候选否决。
+//
+// 调用方持有的是 openAISelectionFilterStats 的值拷贝（finishLoadBalanceSelectionFallback
+// 按值接收），这里始终惰性新建 orderReasons，因此只会写到调用方自己的副本上，
+// 不会通过共享 map 回写污染初筛阶段的统计。
+func (s *openAISelectionFilterStats) excludeOrder(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	if s.orderReasons == nil {
+		s.orderReasons = make(map[string]int, 4)
+	}
+	s.orderReasons[reason]++
 }
 
 // summary renders deterministic exclusion statistics for scheduling error
@@ -1385,6 +1413,24 @@ func (s openAISelectionFilterStats) summary(extra string) string {
 			_, _ = b.WriteString("=")
 			_, _ = b.WriteString(strconv.Itoa(s.reasons[reason]))
 		}
+	}
+	if len(s.orderReasons) > 0 {
+		reasons := make([]string, 0, len(s.orderReasons))
+		for reason := range s.orderReasons {
+			reasons = append(reasons, reason)
+		}
+		sort.Strings(reasons)
+		_, _ = b.WriteString(", order_drop:")
+		for _, reason := range reasons {
+			_, _ = b.WriteString(" ")
+			_, _ = b.WriteString(reason)
+			_, _ = b.WriteString("=")
+			_, _ = b.WriteString(strconv.Itoa(s.orderReasons[reason]))
+		}
+	}
+	if s.orderExamined > 0 {
+		_, _ = b.WriteString(", order_examined=")
+		_, _ = b.WriteString(strconv.Itoa(s.orderExamined))
 	}
 	if extra != "" {
 		_, _ = b.WriteString(", ")
@@ -1703,19 +1749,42 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 					continue
 				}
 			}
-			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
-			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			// 以下逐项判定与原先的 || 短路链完全等价，只是拆开以便归因：
+			// 每条 continue 都先记下否决原因，最终汇入错误摘要的 order_drop。
+			filterStats.orderExamined++
+			fresh, reason := s.service.resolveFreshSchedulableOpenAIAccountWithReason(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if fresh == nil {
+				filterStats.excludeOrder(reason)
+				continue
+			}
+			if !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
+				filterStats.excludeOrder("transport_incompatible")
+				continue
+			}
+			if !s.isAccountRequestCompatible(ctx, fresh, req) {
+				filterStats.excludeOrder("request_incompatible")
 				continue
 			}
 			if !s.consumeOpenAISelectionDBRecheck(budget) {
+				filterStats.excludeOrder("db_recheck_budget_exhausted")
 				return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
 			}
 			fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
-			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			if fresh == nil {
+				filterStats.excludeOrder("db_recheck_rejected")
+				continue
+			}
+			if !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
+				filterStats.excludeOrder("db_recheck_transport_incompatible")
+				continue
+			}
+			if !s.isAccountRequestCompatible(ctx, fresh, req) {
+				filterStats.excludeOrder("db_recheck_request_incompatible")
 				continue
 			}
 			if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
 				compactBlocked = true
+				filterStats.excludeOrder("compact_unsupported")
 				continue
 			}
 			return attachSelectionProfitGate(ctx, &AccountSelectionResult{

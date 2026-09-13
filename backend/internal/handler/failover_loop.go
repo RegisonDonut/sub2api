@@ -2,7 +2,10 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -43,6 +46,13 @@ const (
 	// Service 层在 SingleAccountRetry 模式下已做充分原地重试（最多 3 次、总等待 30s），
 	// Handler 层只需短暂间隔后重新进入 Service 层即可。
 	singleAccountBackoffDelay = 2 * time.Second
+	// accountSelectionRetryAttempts 选号阶段（尚未产生任何上游请求）的重试次数上限。
+	// 单账号分组下，调度器的候选终检（快照刷新 / 阈值 / 流隔离 / DB 复核预算）
+	// 可以在瞬时并发下把唯一候选挡掉，错误里只留下 selection_order_exhausted。
+	// 此时既没有上游状态码也没有 failover 可走，Handler 直接回 503，而 Codex
+	// 不重试 503，会话就此中断。有界重试把这类瞬时窗口吸收掉；持久性错误
+	// （模型不支持等）由调用方的 ModelNotFound 判定提前排除。
+	accountSelectionRetryAttempts = 3
 	// maxProfitVetoAttempts 单次请求内允许的分组利润门终检否决次数上限。
 	// 利润否决不产生上游请求，因此不会推进 SwitchCount；没有独立上限的话，
 	// 「选号 → 终检否决 → 重选」在候选池与账号快照短暂不一致时可以空转很久。
@@ -50,6 +60,62 @@ const (
 	// 同时把整池越线时的无谓选号开销限制在常数级。
 	maxProfitVetoAttempts = 10
 )
+
+// maxModelRateLimitSelectionWait 选号阶段愿意为「模型限流冷却」原地等待的上限。
+//
+// 上游 429 触发的冷却窗口实测为 60s，等一次就能让请求正常跑完，远好过回一个
+// Codex 不会重试的 503。但同一套 model_rate_limits 也承载 30 分钟级的
+// plan-gated 冷却（upstream_400_codex_plan_gated_model），那种必须立刻失败：
+// 把客户端挂在连接上半小时，比明确报错更糟。90s 落在两者之间。
+const maxModelRateLimitSelectionWait = 90 * time.Second
+
+// modelRateLimitWaitBuffer 在冷却到期时间之上多等的一点余量，避免因为
+// 毫秒级的时钟/取整误差刚好卡在到期前一瞬重新选号，白白浪费一次重试。
+const modelRateLimitWaitBuffer = 500 * time.Millisecond
+
+// accountSelectionWaitFor 决定本次选号失败后应当等待多久再重选。
+//
+// cooldown 是调用方查到的「分组内最快恢复的账号还要等多久」：已知且在上限内时
+// 按它精确等待一次；未知（0）或过长时回退到固定指数退避，由重试次数收敛。
+func accountSelectionWaitFor(cooldown time.Duration, attempt int) time.Duration {
+	if cooldown > 0 && cooldown <= maxModelRateLimitSelectionWait {
+		return cooldown + modelRateLimitWaitBuffer
+	}
+	return accountSelectionRetryDelay(attempt)
+}
+
+func accountSelectionRetryDelay(attempt int) time.Duration {
+	delay := 500 * time.Millisecond
+	for i := 0; i < attempt; i++ {
+		delay *= 2
+	}
+	return delay
+}
+
+// selectionTransientRateLimitPattern 匹配调度失败摘要里「非零」的限流/冷却计数。
+// 摘要（summarizeSelectionFailureStats / openAISelectionFilterStats.summary）总是
+// 打印全部计数，包括 model_rate_limited=0；直接对 "rate_limited" 做子串匹配会把
+// 「全部候选因模型不支持而落选」这类永远重试不好的失败也拖进退避，白白多等几秒。
+var selectionTransientRateLimitPattern = regexp.MustCompile(`rate_limited=([1-9][0-9]*)`)
+
+// shouldRetryAccountSelection 判断一次「选号失败」是否值得原地退避后重选。
+//
+// 只覆盖瞬时的调度窗口：
+//   - selection_order_exhausted：候选进入了选择序列，却在终检阶段被逐个挡掉
+//     （快照刷新、调度阈值、代理流隔离、DB 复核预算）。单账号分组下这等于
+//     整池瞬时不可用，几百毫秒后通常自愈。
+//   - rate_limited=N（N>0）：候选确因限流冷却落选。
+//
+// 明确不覆盖 selection_order_empty 与裸 ErrNoAvailableAccounts：前者说明候选序列
+// 本就为空，后者不带任何可判定的瞬时信号，重试只会给客户端徒增延迟。
+func shouldRetryAccountSelection(err error, modelNotFound bool, attempts int) bool {
+	if err == nil || modelNotFound || attempts >= accountSelectionRetryAttempts || !errors.Is(err, service.ErrNoAvailableAccounts) {
+		return false
+	}
+	reason := strings.ToLower(err.Error())
+	return strings.Contains(reason, "selection_order_exhausted") ||
+		selectionTransientRateLimitPattern.MatchString(reason)
+}
 
 // profitVetoExhaustedMessage 是利润否决次数耗尽时返回给客户端的文案。
 // 语义上等同于「无可用账号」：候选账号都不满足分组的利润约束。
@@ -100,6 +166,60 @@ func sameAccountRetryAllowed(failoverErr *service.UpstreamFailoverError, retryCo
 		return true
 	}
 	return retryLimit > 0 && retryCount < retryLimit
+}
+
+// lastAccountWaitRetryableStatus 判断某个上游状态码在「池内已无其它候选」时
+// 是否值得原地等待后重试同一个账号。
+//
+// 只收瞬时不可用：429（限流窗口会过期）与 502/503/504（上游网关抖动）。
+// 明确不收 500 与其它 4xx —— 它们通常由请求本身决定，等多久都一样。
+func lastAccountWaitRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldWaitAndRetryLastAccount 判断是否应当清空排除集、等待后重试同一个账号。
+//
+// 场景：分组里只有一个可调度账号（或全部候选都已落入排除集）。上游失败后
+// 该账号被加进排除集，下一轮选号必然落空，Handler 随即 handleFailoverExhausted
+// 把上游状态码原样抛给客户端 —— maxAccountSwitches 配了 10 也没有意义，因为
+// 根本没有第二个号可切。对 Codex 这类客户端，一次 502/503 就等于会话中断。
+//
+// 既然没有别的号可换，正确动作是在同一个号上等一会儿再试，而不是立刻放弃。
+// 上界复用 switchCount/maxSwitches：每轮失败都会推进 switchCount，因此等待轮次
+// 天然收敛，不需要再引入一个独立计数器。
+//
+// 凭证类失败（401/403 等 GatewayFailureStageAccountAuth）不在此列：等待不会
+// 让一把坏 token 变好，只会把失败延迟几十秒后再报出来。
+func shouldWaitAndRetryLastAccount(failoverErr *service.UpstreamFailoverError, switchCount, maxSwitches int) bool {
+	if failoverErr == nil || !failoverErr.ShouldRetryNextAccount() {
+		return false
+	}
+	if failoverErr.IsCredentialFailure() {
+		return false
+	}
+	if switchCount > maxSwitches {
+		return false
+	}
+	return lastAccountWaitRetryableStatus(failoverErr.StatusCode)
+}
+
+// lastAccountWaitDelay 单账号等待重试的间隔。
+// 取 singleAccountBackoffDelay 与上游给出的 SameAccountRetryDelay（如 Retry-After
+// 推导值）的较大者：既尊重上游要求的冷却时间，也保证不会比 2s 更频繁地空转。
+func lastAccountWaitDelay(failoverErr *service.UpstreamFailoverError) time.Duration {
+	delay := singleAccountBackoffDelay
+	if failoverErr != nil && failoverErr.SameAccountRetryDelay > delay {
+		delay = failoverErr.SameAccountRetryDelay
+	}
+	return delay
 }
 
 // sameAccountRetryDeadlineAllows prevents a retry from starting after the

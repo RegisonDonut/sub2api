@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1038,5 +1040,122 @@ func TestFailoverClientGone(t *testing.T) {
 
 	t.Run("nil安全", func(t *testing.T) {
 		require.False(t, failoverClientGone(nil))
+	})
+}
+
+func TestShouldRetryAccountSelection(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		modelNotFound bool
+		attempts      int
+		want          bool
+	}{
+		// 生产日志实测串：单账号分组瞬时挡号，占 2026-09-13 全部选号失败的 98%。
+		{"selection order exhausted", fmt.Errorf("%w supporting model: gpt-5.6-sol (pool=1, selection_order_exhausted)", service.ErrNoAvailableAccounts), false, 0, true},
+		{"nonzero rate limited", fmt.Errorf("%w supporting model: x (pool=3, filtered: model_rate_limited=2)", service.ErrNoAvailableAccounts), false, 0, true},
+		// model_rate_limited=0 只是摘要里的常驻字段，不是瞬时信号，重试纯属浪费。
+		{"zero rate limited", fmt.Errorf("%w supporting model: x (total=5 model_unsupported=5 model_rate_limited=0)", service.ErrNoAvailableAccounts), false, 0, false},
+		// 候选序列本就为空，退避改变不了任何东西。
+		{"selection order empty", fmt.Errorf("%w supporting model: x (pool=1, selection_order_empty)", service.ErrNoAvailableAccounts), false, 0, false},
+		{"already excluded pool", fmt.Errorf("%w supporting model: x (pool=1, filtered: excluded=1)", service.ErrNoAvailableAccounts), false, 0, false},
+		{"bare no accounts", service.ErrNoAvailableAccounts, false, 0, false},
+		{"unsupported model", fmt.Errorf("%w supporting model", service.ErrNoAvailableAccounts), true, 0, false},
+		{"attempts exhausted", fmt.Errorf("%w: selection_order_exhausted", service.ErrNoAvailableAccounts), false, accountSelectionRetryAttempts, false},
+		{"unrelated error", errors.New("selection_order_exhausted"), false, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, shouldRetryAccountSelection(tt.err, tt.modelNotFound, tt.attempts))
+		})
+	}
+}
+
+func TestShouldWaitAndRetryLastAccount(t *testing.T) {
+	const maxSwitches = 10
+
+	tests := []struct {
+		name        string
+		err         *service.UpstreamFailoverError
+		switchCount int
+		want        bool
+	}{
+		// 生产实测：单账号分组唯一账号吃到上游 429/502 后被排除，
+		// 下一轮选号必然落空。这两条是本改动要救的场景。
+		{"upstream 429", &service.UpstreamFailoverError{StatusCode: http.StatusTooManyRequests}, 1, true},
+		{"upstream 502", &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, 1, true},
+		{"upstream 503", &service.UpstreamFailoverError{StatusCode: http.StatusServiceUnavailable}, 1, true},
+		{"upstream 504", &service.UpstreamFailoverError{StatusCode: http.StatusGatewayTimeout}, 1, true},
+
+		// 请求本身决定的失败，等多久都一样。
+		{"upstream 400", &service.UpstreamFailoverError{StatusCode: http.StatusBadRequest}, 1, false},
+		{"upstream 500", &service.UpstreamFailoverError{StatusCode: http.StatusInternalServerError}, 1, false},
+
+		// 坏凭证不会因为等待而变好，只会把失败延后几十秒才报出来。
+		{"credential failure", &service.UpstreamFailoverError{
+			StatusCode: http.StatusServiceUnavailable,
+			Stage:      service.GatewayFailureStageAccountAuth,
+		}, 1, false},
+
+		// 上游已明确要求停止 failover。
+		{"next account stop", &service.UpstreamFailoverError{
+			StatusCode:        http.StatusBadGateway,
+			NextAccountAction: service.NextAccountStop,
+		}, 1, false},
+
+		{"switch budget exhausted", &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, maxSwitches + 1, false},
+		{"switch budget boundary", &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, maxSwitches, true},
+
+		// 从未打过上游：没有可等待的对象，应走原有的「无可用账号」分类。
+		{"no upstream attempt", nil, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, shouldWaitAndRetryLastAccount(tt.err, tt.switchCount, maxSwitches))
+		})
+	}
+}
+
+func TestLastAccountWaitDelay(t *testing.T) {
+	t.Run("floors at the single-account backoff", func(t *testing.T) {
+		require.Equal(t, singleAccountBackoffDelay, lastAccountWaitDelay(nil))
+		require.Equal(t, singleAccountBackoffDelay, lastAccountWaitDelay(&service.UpstreamFailoverError{
+			StatusCode:            http.StatusBadGateway,
+			SameAccountRetryDelay: 100 * time.Millisecond,
+		}))
+	})
+
+	t.Run("honors a longer upstream-provided cooldown", func(t *testing.T) {
+		// 上游 Retry-After 推导出的冷却比默认退避长时必须照办，
+		// 否则等于在限流窗口里反复撞同一个号。
+		require.Equal(t, 30*time.Second, lastAccountWaitDelay(&service.UpstreamFailoverError{
+			StatusCode:            http.StatusTooManyRequests,
+			SameAccountRetryDelay: 30 * time.Second,
+		}))
+	})
+}
+
+func TestAccountSelectionWaitFor(t *testing.T) {
+	t.Run("waits out a known short cooldown in one shot", func(t *testing.T) {
+		// 生产实测：上游 429 打出的模型冷却是 60s。固定退避总共只有
+		// 0.5+1+2=3.5s，必然在冷却结束前耗尽重试并回 503。
+		require.Equal(t, 60*time.Second+modelRateLimitWaitBuffer, accountSelectionWaitFor(60*time.Second, 0))
+	})
+
+	t.Run("falls back to backoff when no cooldown is known", func(t *testing.T) {
+		require.Equal(t, accountSelectionRetryDelay(0), accountSelectionWaitFor(0, 0))
+		require.Equal(t, accountSelectionRetryDelay(2), accountSelectionWaitFor(0, 2))
+	})
+
+	t.Run("refuses to hang on a long cooldown", func(t *testing.T) {
+		// plan-gated 冷却是 30 分钟级：把客户端挂在连接上半小时比明确报错更糟。
+		require.Equal(t, accountSelectionRetryDelay(1), accountSelectionWaitFor(30*time.Minute, 1))
+		require.Equal(t, accountSelectionRetryDelay(0), accountSelectionWaitFor(maxModelRateLimitSelectionWait+time.Second, 0))
+	})
+
+	t.Run("boundary cooldown is still honored", func(t *testing.T) {
+		require.Equal(t, maxModelRateLimitSelectionWait+modelRateLimitWaitBuffer,
+			accountSelectionWaitFor(maxModelRateLimitSelectionWait, 0))
 	})
 }

@@ -625,6 +625,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	var passthroughFailoverState openAIPassthroughFailoverState
+	selectionRetryCount := 0
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -681,11 +682,49 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 				cls = classifySelectionFailureError(err, cls)
+				if shouldRetryAccountSelection(err, cls.ModelNotFound, selectionRetryCount) {
+					selectionRetryCount++
+					cooldown := h.gatewayService.ShortestOpenAIModelRateLimitWait(c.Request.Context(), apiKey.GroupID, requestPlatform, reqModel)
+					delay := accountSelectionWaitFor(cooldown, selectionRetryCount-1)
+					reqLog.Warn("openai.account_selection_retry",
+						zap.Int("retry_count", selectionRetryCount),
+						zap.Duration("model_rate_limit_cooldown", cooldown),
+						zap.Duration("retry_delay", delay),
+					)
+					if !sleepWithContext(c.Request.Context(), delay) {
+						return
+					}
+					continue
+				}
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
+				// lastFailoverErr 非空说明排除集是被单账号等待重试清空的，本请求
+				// 已经真实打过上游。此时报通用 503 会把 429/502 的上游语义抹掉，
+				// 客户端据此做的重试决策也会跟着错，必须回落到原始上游错误。
+				if lastFailoverErr != nil && !cls.ModelNotFound {
+					h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
+					return
+				}
 				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
+			}
+			// 池内已无其它候选：与其立刻把上游状态码抛给客户端，不如清空排除集、
+			// 等待后重试同一个账号（单账号分组下这是唯一可能成功的动作）。
+			if shouldWaitAndRetryLastAccount(lastFailoverErr, switchCount, maxAccountSwitches) {
+				delay := lastAccountWaitDelay(lastFailoverErr)
+				reqLog.Warn("openai.last_account_wait_retry",
+					zap.Int("upstream_status", lastFailoverErr.StatusCode),
+					zap.Int("excluded_account_count", len(failedAccountIDs)),
+					zap.Int("switch_count", switchCount),
+					zap.Int("max_switches", maxAccountSwitches),
+					zap.Duration("retry_delay", delay),
+				)
+				if !sleepWithContext(c.Request.Context(), delay) {
+					return
+				}
+				failedAccountIDs = make(map[int64]struct{})
+				continue
 			}
 			if lastFailoverErr != nil {
 				h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
@@ -694,6 +733,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 			return
 		}
+		selectionRetryCount = 0
 		if selection == nil || selection.Account == nil {
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 			if !cls.ModelNotFound {

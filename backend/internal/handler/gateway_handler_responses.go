@@ -168,6 +168,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 	// 3. Account selection + failover loop
 	fs := NewFailoverState(h.maxAccountSwitches, false)
+	selectionRetryCount := 0
 
 	for {
 		if requestCtx.Err() != nil {
@@ -178,6 +179,15 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			if len(fs.FailedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, effectiveAPIKeyPlatform(c, apiKey))
 				cls = classifySelectionFailureError(err, cls)
+				if shouldRetryAccountSelection(err, cls.ModelNotFound, selectionRetryCount) {
+					selectionRetryCount++
+					delay := accountSelectionRetryDelay(selectionRetryCount - 1)
+					reqLog.Warn("gateway.responses.account_selection_retry", zap.Int("retry_count", selectionRetryCount), zap.Duration("retry_delay", delay))
+					if !sleepWithContext(requestCtx, delay) {
+						return
+					}
+					continue
+				}
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
@@ -314,6 +324,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			)
 			return
 		}
+		selectionRetryCount = 0
 
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")

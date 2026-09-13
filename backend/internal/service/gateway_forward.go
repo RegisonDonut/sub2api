@@ -34,9 +34,11 @@ const (
 )
 
 func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode int) bool {
-	// OAuth/Setup Token 账号：仅 403 重试
+	// OAuth/Setup Token 账号：403 以及临时 5xx 重试。OAuth 上游的 503
+	// 常见于短暂网关/容量抖动，直接跳过通用重试会立即进入 failover，
+	// 在池中没有第二个可用账号时就把一次瞬时故障暴露给客户端。
 	if account.IsOAuth() {
-		return statusCode == 403
+		return statusCode == 403 || statusCode >= 500
 	}
 
 	// API Key 账号：未配置的错误码重试

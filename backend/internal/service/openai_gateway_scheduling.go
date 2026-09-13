@@ -1509,19 +1509,39 @@ func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, accoun
 }
 
 func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccount(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
-	fresh := s.resolveFreshSchedulableOpenAIAccountBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
-	if fresh == nil {
-		return nil
-	}
-	if vetoed, _ := openAIProfitControlVetoReason(ctx, fresh); vetoed {
-		return nil
-	}
+	fresh, _ := s.resolveFreshSchedulableOpenAIAccountWithReason(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
 	return fresh
 }
 
+// resolveFreshSchedulableOpenAIAccountWithReason 与 resolveFreshSchedulableOpenAIAccount
+// 等价，额外返回候选被否决的原因标识。
+//
+// 存在的意义是可观测性：调度终检有七道独立检查，原本全部合并成一个 nil 返回值，
+// 调用方只能在错误串里写 selection_order_exhausted，说不出到底是哪一道挡的。
+// 单账号分组下这正是 503 的唯一线索，缺了它排查只能靠猜。
+//
+// 返回的 reason 只用于日志与错误摘要，不参与任何调度决策。
+func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountWithReason(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) (*Account, string) {
+	fresh, reason := s.resolveFreshSchedulableOpenAIAccountBeforeProfitWithReason(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
+	if fresh == nil {
+		return nil, reason
+	}
+	if vetoed, _ := openAIProfitControlVetoReason(ctx, fresh); vetoed {
+		return nil, "profit_veto"
+	}
+	return fresh, ""
+}
+
 func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
+	fresh, _ := s.resolveFreshSchedulableOpenAIAccountBeforeProfitWithReason(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
+	return fresh
+}
+
+// resolveFreshSchedulableOpenAIAccountBeforeProfitWithReason 的 reason 取值与各道
+// 检查一一对应，便于在错误摘要里直接按 reason 聚合定位。
+func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfitWithReason(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) (*Account, string) {
 	if account == nil {
-		return nil
+		return nil, "nil_account"
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 
@@ -1529,27 +1549,32 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 	if s.schedulerSnapshot != nil {
 		current, err := s.getSchedulableAccount(ctx, account.ID)
 		if err != nil || current == nil {
-			return nil
+			// 候选来自调度快照，重新解析时却查不到：账号在本次选号过程中
+			// 被并发地停用/改组，或快照与权威数据已经不一致。
+			return nil, "snapshot_unresolvable"
 		}
 		fresh = current
 	}
 
-	if !isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx, fresh, platform, requestedModel, requireCompact, requiredCapability) {
-		return nil
+	// 直接透传具体原因（model_rate_limited / quota_auto_pause_7d / capability_mismatch …）。
+	// 压成一个笼统的 not_eligible 等于把已经算好的诊断信息丢掉，而这正是
+	// 单账号分组下排查 503 的唯一线索。
+	if reason := openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx, fresh, platform, requestedModel, requireCompact, requiredCapability); reason != "" {
+		return nil, reason
 	}
 	if !parentHealthyForShadow(fresh, s.parentAccountLookup(ctx)) {
-		return nil
+		return nil, "parent_unhealthy"
 	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(fresh, requestedModel) {
-		return nil
+		return nil, "runtime_blocked"
 	}
 	if s.isOpenAIAccountBlockedBySchedulingThreshold(ctx, fresh) {
-		return nil
+		return nil, "scheduling_threshold"
 	}
 	if s.isOpenAIProxyStreamQuarantined(ctx, fresh) {
-		return nil
+		return nil, "proxy_stream_quarantined"
 	}
-	return fresh
+	return fresh, ""
 }
 
 // parentAccountLookup 返回供 parentHealthyForShadow 使用的母账号解析闭包:经 accountRepo
@@ -1739,4 +1764,42 @@ func (s *OpenAIGatewayService) schedulingConfig() config.GatewaySchedulingConfig
 		LoadBatchEnabled:         true,
 		SlotCleanupInterval:      30 * time.Second,
 	}
+}
+
+// ShortestOpenAIModelRateLimitWait 返回分组内「最快恢复」的账号还要等多久才能
+// 承接该模型的请求；没有任何账号只差一个模型限流冷却时返回 0。
+//
+// 为什么需要它：模型级限流冷却的窗口由上游 429 决定（生产实测 60s），而 Handler
+// 的选号退避是固定的 0.5+1+2=3.5s。单账号分组下，冷却期内唯一的候选必然
+// not eligible，盲目退避只会在冷却结束前耗尽重试次数，然后回一个 503 —— 而
+// Codex 不重试 503，会话当场中断。冷却剩余时间本来就是已知的，按它精确等待
+// 一次即可，既不浪费轮次也不会等过头。
+//
+// 只统计「其它条件都满足、只差冷却」的账号：模型压根不支持、或账号不可调度的，
+// 等到天荒地老也不会变得可用，把它们算进来只会让调用方白等。
+func (s *OpenAIGatewayService) ShortestOpenAIModelRateLimitWait(ctx context.Context, groupID *int64, platform string, requestedModel string) time.Duration {
+	if s == nil || strings.TrimSpace(requestedModel) == "" {
+		return 0
+	}
+	accounts, err := s.listSchedulableAccounts(ctx, groupID, NormalizeOpenAICompatiblePlatform(platform))
+	if err != nil {
+		return 0
+	}
+
+	shortest := time.Duration(0)
+	for i := range accounts {
+		account := &accounts[i]
+		if !account.IsSchedulable() || !account.IsModelSupported(requestedModel) {
+			continue
+		}
+		remaining := account.GetModelRateLimitRemainingTimeWithContext(ctx, requestedModel)
+		if remaining <= 0 {
+			// 该账号此刻没有冷却：它落选另有原因，等待解决不了问题。
+			continue
+		}
+		if shortest == 0 || remaining < shortest {
+			shortest = remaining
+		}
+	}
+	return shortest
 }
