@@ -387,6 +387,26 @@ func isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx context.Context
 	return openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability) == ""
 }
 
+type openAISingleAccountRateLimitBypass struct {
+	accountID int64
+	model     string
+}
+
+// WithOpenAISingleAccountRateLimitBypass permits one request to retry the
+// exact account/model pair that just returned 429. Other scheduling gates and
+// the global model cooldown remain intact for every other request.
+func WithOpenAISingleAccountRateLimitBypass(ctx context.Context, accountID int64, model string) context.Context {
+	return context.WithValue(ctx, openAISingleAccountRateLimitBypass{}, openAISingleAccountRateLimitBypass{
+		accountID: accountID,
+		model:     model,
+	})
+}
+
+func openAISingleAccountRateLimitBypassMatches(ctx context.Context, accountID int64, model string) bool {
+	bypass, ok := ctx.Value(openAISingleAccountRateLimitBypass{}).(openAISingleAccountRateLimitBypass)
+	return ok && bypass.accountID == accountID && bypass.model == model
+}
+
 func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) string {
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if account == nil {
@@ -395,7 +415,8 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 	if account.Platform != platform || !account.IsOpenAICompatible() {
 		return "platform_mismatch"
 	}
-	if !account.IsSchedulableForModelWithContext(ctx, requestedModel) {
+	if !account.IsSchedulableForModelWithContext(ctx, requestedModel) &&
+		!(account.IsSchedulable() && openAISingleAccountRateLimitBypassMatches(ctx, account.ID, requestedModel)) {
 		if account.IsSchedulable() {
 			return "model_rate_limited"
 		}

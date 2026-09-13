@@ -630,6 +630,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// candidate set. This survives clearing failedAccountIDs below so the next
 	// selection failure keeps the short same-account cadence.
 	singleAccountRetryMode := false
+	var singleAccountRetryAccountID int64
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -655,8 +656,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		// Select account supporting the requested model
 		reqLog.Debug("openai.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
+		selectionCtx := c.Request.Context()
+		if singleAccountRetryMode && singleAccountRetryAccountID > 0 {
+			selectionCtx = service.WithOpenAISingleAccountRateLimitBypass(selectionCtx, singleAccountRetryAccountID, reqModel)
+		}
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
+			selectionCtx,
 			apiKey.GroupID,
 			previousResponseID,
 			sessionHash,
@@ -761,6 +766,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		singleAccountRetryMode = false
+		singleAccountRetryAccountID = 0
 		if previousResponseID != "" && selection != nil && selection.Account != nil {
 			reqLog.Debug("openai.account_selected_with_previous_response_id", zap.Int64("account_id", selection.Account.ID))
 		}
@@ -968,6 +974,27 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 							}
 							continue
 						}
+					}
+					// A one-account pool cannot fail over. Retry the exact account/model
+					// pair directly and bypass only this request's model cooldown; merely
+					// re-running normal selection would reject it without an upstream call.
+					if failoverErr.StatusCode == http.StatusTooManyRequests &&
+						scheduleDecision.CandidateCount == 1 &&
+						switchCount < singleAccountRateLimitRetryAttempts {
+						switchCount++
+						lastFailoverErr = failoverErr
+						singleAccountRetryMode = true
+						singleAccountRetryAccountID = account.ID
+						reqLog.Warn("openai.single_account_rate_limit_retry",
+							zap.Int64("account_id", account.ID),
+							zap.Int("retry_count", switchCount),
+							zap.Int("retry_limit", singleAccountRateLimitRetryAttempts),
+							zap.Duration("retry_delay", singleAccountBackoffDelay),
+						)
+						if !sleepWithContext(c.Request.Context(), singleAccountBackoffDelay) {
+							return
+						}
+						continue
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}

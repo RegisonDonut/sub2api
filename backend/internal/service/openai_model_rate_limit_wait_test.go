@@ -77,3 +77,32 @@ func TestShortestOpenAIModelRateLimitWait(t *testing.T) {
 		require.Zero(t, got)
 	})
 }
+
+func TestOpenAISingleAccountRateLimitBypass(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	account := Account{
+		ID: 7, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+		Status: StatusActive, Schedulable: true, Concurrency: 1,
+	}
+	setAccountModelRateLimitSnapshot(&account, model, time.Now().Add(time.Minute), "upstream 429", time.Now())
+
+	require.Equal(t, "model_rate_limited",
+		openAICompatibleAccountEligibilityFailureReasonBeforeProfit(
+			context.Background(), &account, PlatformOpenAI, model, false, OpenAIEndpointCapabilityResponses,
+		))
+
+	bypassCtx := WithOpenAISingleAccountRateLimitBypass(context.Background(), account.ID, model)
+	require.Empty(t, openAICompatibleAccountEligibilityFailureReasonBeforeProfit(
+		bypassCtx, &account, PlatformOpenAI, model, false, OpenAIEndpointCapabilityResponses,
+	))
+	otherAccount := account
+	otherAccount.ID = 8
+	require.Equal(t, "model_rate_limited", openAICompatibleAccountEligibilityFailureReasonBeforeProfit(
+		bypassCtx, &otherAccount, PlatformOpenAI, model, false, OpenAIEndpointCapabilityResponses,
+	))
+
+	account.Schedulable = false
+	require.Equal(t, "not_schedulable", openAICompatibleAccountEligibilityFailureReasonBeforeProfit(
+		bypassCtx, &account, PlatformOpenAI, model, false, OpenAIEndpointCapabilityResponses,
+	))
+}
