@@ -45,6 +45,21 @@ func TestNormalizeOpenAIAutoResetCreditExtra(t *testing.T) {
 	})
 }
 
+func TestAllOpenAIQuotaExhausted(t *testing.T) {
+	now := time.Now()
+	account := func(used5h, used7d float64) Account {
+		return Account{Extra: map[string]any{
+			"codex_5h_used_percent":  used5h,
+			"codex_7d_used_percent":  used7d,
+			"codex_usage_updated_at": now.Format(time.RFC3339),
+		}}
+	}
+	require.False(t, allOpenAIQuotaExhausted(nil, now))
+	require.True(t, allOpenAIQuotaExhausted([]Account{account(100, 100), account(100, 100)}, now))
+	require.False(t, allOpenAIQuotaExhausted([]Account{account(100, 100), account(99, 99)}, now))
+	require.False(t, allOpenAIQuotaExhausted([]Account{account(100, 0)}, now))
+}
+
 func TestShouldAutoPauseOpenAIAccountByQuota_AutoResetCreditStates(t *testing.T) {
 	now := time.Now().UTC()
 	baseExtra := map[string]any{

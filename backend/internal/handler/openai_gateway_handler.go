@@ -631,6 +631,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// selection failure keeps the short same-account cadence.
 	singleAccountRetryMode := false
 	var singleAccountRetryAccountID int64
+	requestAutoResetAttempted := false
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -691,6 +692,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 				cls = classifySelectionFailureError(err, cls)
+				if !requestAutoResetAttempted && !cls.ModelNotFound && apiKey.GroupID != nil {
+					requestAutoResetAttempted = true
+					if recovered, resetErr := service.TryRecoverExhaustedOpenAIGroup(c.Request.Context(), *apiKey.GroupID); resetErr != nil {
+						reqLog.Warn("openai.account_selection_auto_reset_failed", zap.Error(resetErr))
+					} else if recovered {
+						reqLog.Info("openai.account_selection_auto_reset_recovered")
+						selectionRetryCount = 0
+						continue
+					}
+				}
 				selectionRetryLimit := accountSelectionRetryAttempts
 				if singleAccountRetryMode {
 					selectionRetryLimit = maxAccountSwitches
@@ -1343,6 +1354,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	effectiveMappedModel := preferredMappedModel
+	requestAutoResetAttempted := false
 
 	// 分组利润控制：Messages 文本入口同样请求级装门并固定 pricingAt。
 	msgPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
@@ -1383,6 +1395,15 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
 					cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+					if !requestAutoResetAttempted && !cls.ModelNotFound && apiKey.GroupID != nil {
+						requestAutoResetAttempted = true
+						if recovered, resetErr := service.TryRecoverExhaustedOpenAIGroup(c.Request.Context(), *apiKey.GroupID); resetErr != nil {
+							reqLog.Warn("openai_messages.account_selection_auto_reset_failed", zap.Error(resetErr))
+						} else if recovered {
+							reqLog.Info("openai_messages.account_selection_auto_reset_recovered")
+							continue
+						}
+					}
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}
@@ -2703,6 +2724,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 建连时刻只用于选号/准入，不作为任何 turn 的计费定价时刻。
 	wsPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(ctx, apiKey.GroupID)
 	ctx = wsPricingCtx
+	requestAutoResetAttempted := false
 
 	for {
 		if ctx.Err() != nil {
@@ -2728,6 +2750,17 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
+			if !requestAutoResetAttempted && apiKey.GroupID != nil {
+				requestAutoResetAttempted = true
+				if recovered, resetErr := service.TryRecoverExhaustedOpenAIGroup(ctx, *apiKey.GroupID); resetErr != nil {
+					reqLog.Warn("openai.websocket_account_selection_auto_reset_failed", zap.Error(resetErr))
+				} else if recovered {
+					reqLog.Info("openai.websocket_account_selection_auto_reset_recovered")
+					failedAccountIDs = make(map[int64]struct{})
+					lastFailoverErr = nil
+					continue
+				}
+			}
 			if lastFailoverErr != nil {
 				closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
 			} else {

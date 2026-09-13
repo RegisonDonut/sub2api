@@ -59,6 +59,7 @@ type openAIAutoResetQuota interface {
 }
 
 type openAIAutoResetContextKey struct{}
+type openAIAutoResetForceContextKey struct{}
 
 func withOpenAIAutoResetContext(ctx context.Context) context.Context {
 	if ctx == nil {
@@ -72,6 +73,21 @@ func isOpenAIAutoResetContext(ctx context.Context) bool {
 		return false
 	}
 	value, _ := ctx.Value(openAIAutoResetContextKey{}).(bool)
+	return value
+}
+
+func withOpenAIAutoResetForceContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIAutoResetForceContextKey{}, true)
+}
+
+func isOpenAIAutoResetForceContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(openAIAutoResetForceContextKey{}).(bool)
 	return value
 }
 
@@ -90,14 +106,71 @@ type OpenAIQuotaAutoResetService struct {
 	settings    *SettingService
 	leaderLock  LeaderLockCache
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	queue   chan int64
-	pending sync.Map
-	owner   string
-	start   sync.Once
-	stop    sync.Once
-	wg      sync.WaitGroup
+	ctx               context.Context
+	cancel            context.CancelFunc
+	queue             chan int64
+	pending           sync.Map
+	owner             string
+	start             sync.Once
+	stop              sync.Once
+	requestRecoveryMu sync.Mutex
+	wg                sync.WaitGroup
+}
+
+// RecoverExhaustedGroup synchronously consumes one reset credit when a request
+// has confirmed that every schedulable OpenAI account in the group is out of
+// quota. It is deliberately a request-failure fallback; normal proactive
+// auto-reset remains controlled by each account's opt-in setting.
+func (s *OpenAIQuotaAutoResetService) RecoverExhaustedGroup(ctx context.Context, groupID int64) (bool, error) {
+	if s == nil || s.accountRepo == nil || s.quota == nil || groupID <= 0 {
+		return false, nil
+	}
+	s.requestRecoveryMu.Lock()
+	defer s.requestRecoveryMu.Unlock()
+	accounts, err := s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, groupID, PlatformOpenAI)
+	if err != nil {
+		return false, err
+	}
+	if len(accounts) == 0 {
+		return false, nil
+	}
+	if !allOpenAIQuotaExhausted(accounts, time.Now()) {
+		return false, nil
+	}
+	// Query candidates in stable account order. evaluateAccount re-reads the
+	// account and the upstream credit list, then uses the existing idempotent
+	// consume/recovery path, so card identifiers never enter request logs.
+	for i := range accounts {
+		accountID := accounts[i].ID
+		if err := s.evaluateAccount(withOpenAIAutoResetForceContext(ctx), accountID); err != nil {
+			slog.Warn("openai_request_auto_reset_failed", "account_id", accountID, "error", err)
+			continue
+		}
+		updated, getErr := s.accountRepo.GetByID(ctx, accountID)
+		if getErr != nil || updated == nil {
+			continue
+		}
+		state := openAIAutoResetStateFromExtra(updated.Extra)
+		if state != nil && state.Status == OpenAIAutoResetStatusSuccess {
+			slog.Info("openai_request_auto_reset_success", "account_id", accountID, "group_id", groupID)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func allOpenAIQuotaExhausted(accounts []Account, now time.Time) bool {
+	if len(accounts) == 0 {
+		return false
+	}
+	for i := range accounts {
+		used5h, ok5h := resolveOpenAIQuotaUtilization(accounts[i].Extra, "5h", now)
+		used7d, ok7d := resolveOpenAIQuotaUtilization(accounts[i].Extra, "7d", now)
+		if (!ok5h || used5h < 1) && (!ok7d || used7d < 1) {
+			return false
+		}
+	}
+	return true
 }
 
 func NewOpenAIQuotaAutoResetService(
@@ -270,6 +343,7 @@ type openAIAutoResetAssessment struct {
 
 func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accountID int64) error {
 	ctx = withOpenAIAutoResetContext(ctx)
+	force := isOpenAIAutoResetForceContext(ctx)
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil || account == nil {
 		return err
@@ -281,8 +355,11 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		return nil
 	}
 	config := ResolveOpenAIAutoResetCreditConfig(account)
-	if !config.Enabled || !account.IsActive() || !account.Schedulable {
+	if (!config.Enabled && !force) || !account.IsActive() || !account.Schedulable {
 		return nil
+	}
+	if force {
+		config.Enabled = true
 	}
 
 	now := time.Now()
@@ -335,8 +412,11 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		return err
 	}
 	config = ResolveOpenAIAutoResetCreditConfig(account)
-	if !config.Enabled {
+	if !config.Enabled && !force {
 		return nil
+	}
+	if force {
+		config.Enabled = true
 	}
 	assessment = s.assessUsage(usage, account, config, now)
 	available := usage.RateLimitResetCredits.AvailableCount
@@ -807,4 +887,16 @@ func notifyOpenAIAutoReset(accountID int64) {
 // NotifyOpenAIAutoResetCredit 供额度查询入口发送轻量信号；不执行同步上游请求。
 func NotifyOpenAIAutoResetCredit(accountID int64) {
 	notifyOpenAIAutoReset(accountID)
+}
+
+// TryRecoverExhaustedOpenAIGroup is the request-path hook used by gateway
+// handlers. It is a no-op when the auto-reset service is not wired.
+func TryRecoverExhaustedOpenAIGroup(ctx context.Context, groupID int64) (bool, error) {
+	openAIAutoResetNotifierRegistry.RLock()
+	service := openAIAutoResetNotifierRegistry.service
+	openAIAutoResetNotifierRegistry.RUnlock()
+	if service == nil {
+		return false, nil
+	}
+	return service.RecoverExhaustedGroup(ctx, groupID)
 }
