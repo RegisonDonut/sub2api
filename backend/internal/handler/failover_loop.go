@@ -90,7 +90,7 @@ func accountSelectionWaitFor(cooldown time.Duration, attempt int) time.Duration 
 // waiting for its full window here makes a one-account request outlive the
 // client's retry budget.
 func accountSelectionWaitForSingleAccount(attempt int) time.Duration {
-	return accountSelectionRetryDelay(attempt)
+	return singleAccountBackoffDelay
 }
 
 func accountSelectionRetryDelay(attempt int) time.Duration {
