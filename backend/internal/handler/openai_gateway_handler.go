@@ -685,7 +685,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				if shouldRetryAccountSelection(err, cls.ModelNotFound, selectionRetryCount) {
 					selectionRetryCount++
 					cooldown := h.gatewayService.ShortestOpenAIModelRateLimitWait(c.Request.Context(), apiKey.GroupID, requestPlatform, reqModel)
-					delay := accountSelectionWaitFor(cooldown, selectionRetryCount-1)
+					// Once the single selected account is in the exclusion set, keep
+					// using the short same-account cadence. A 60s model cooldown is
+					// longer than the client request budget and cannot be bypassed by
+					// another account in this path.
+					var delay time.Duration
+					if len(failedAccountIDs) == 1 {
+						delay = accountSelectionWaitForSingleAccount(selectionRetryCount - 1)
+					} else {
+						delay = accountSelectionWaitFor(cooldown, selectionRetryCount-1)
+					}
 					reqLog.Warn("openai.account_selection_retry",
 						zap.Int("retry_count", selectionRetryCount),
 						zap.Duration("model_rate_limit_cooldown", cooldown),

@@ -1137,6 +1137,11 @@ func TestLastAccountWaitDelay(t *testing.T) {
 }
 
 func TestAccountSelectionWaitFor(t *testing.T) {
+	t.Run("single account ignores model cooldown", func(t *testing.T) {
+		require.Equal(t, 500*time.Millisecond, accountSelectionWaitForSingleAccount(0))
+		require.Equal(t, 1*time.Second, accountSelectionWaitForSingleAccount(1))
+		require.Equal(t, 2*time.Second, accountSelectionWaitForSingleAccount(2))
+	})
 	t.Run("waits out a known short cooldown in one shot", func(t *testing.T) {
 		// 生产实测：上游 429 打出的模型冷却是 60s。固定退避总共只有
 		// 0.5+1+2=3.5s，必然在冷却结束前耗尽重试并回 503。

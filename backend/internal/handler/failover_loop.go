@@ -84,6 +84,15 @@ func accountSelectionWaitFor(cooldown time.Duration, attempt int) time.Duration 
 	return accountSelectionRetryDelay(attempt)
 }
 
+// accountSelectionWaitForSingleAccount keeps the request on the existing
+// short retry cadence when the only candidate has just returned 429. The
+// model-level cooldown is useful for choosing among multiple accounts, but
+// waiting for its full window here makes a one-account request outlive the
+// client's retry budget.
+func accountSelectionWaitForSingleAccount(attempt int) time.Duration {
+	return accountSelectionRetryDelay(attempt)
+}
+
 func accountSelectionRetryDelay(attempt int) time.Duration {
 	delay := 500 * time.Millisecond
 	for i := 0; i < attempt; i++ {
