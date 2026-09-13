@@ -686,7 +686,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 				cls = classifySelectionFailureError(err, cls)
-				if shouldRetryAccountSelection(err, cls.ModelNotFound, selectionRetryCount) {
+				selectionRetryLimit := accountSelectionRetryAttempts
+				if singleAccountRetryMode {
+					selectionRetryLimit = maxAccountSwitches
+				}
+				if shouldRetryAccountSelectionUpTo(err, cls.ModelNotFound, selectionRetryCount, selectionRetryLimit) {
 					selectionRetryCount++
 					cooldown := h.gatewayService.ShortestOpenAIModelRateLimitWait(c.Request.Context(), apiKey.GroupID, requestPlatform, reqModel)
 					// Once the single selected account is in the exclusion set, keep

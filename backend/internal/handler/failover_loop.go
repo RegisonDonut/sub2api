@@ -118,7 +118,11 @@ var selectionTransientRateLimitPattern = regexp.MustCompile(`rate_limited=([1-9]
 // 明确不覆盖 selection_order_empty 与裸 ErrNoAvailableAccounts：前者说明候选序列
 // 本就为空，后者不带任何可判定的瞬时信号，重试只会给客户端徒增延迟。
 func shouldRetryAccountSelection(err error, modelNotFound bool, attempts int) bool {
-	if err == nil || modelNotFound || attempts >= accountSelectionRetryAttempts || !errors.Is(err, service.ErrNoAvailableAccounts) {
+	return shouldRetryAccountSelectionUpTo(err, modelNotFound, attempts, accountSelectionRetryAttempts)
+}
+
+func shouldRetryAccountSelectionUpTo(err error, modelNotFound bool, attempts, maxAttempts int) bool {
+	if err == nil || modelNotFound || attempts >= maxAttempts || !errors.Is(err, service.ErrNoAvailableAccounts) {
 		return false
 	}
 	reason := strings.ToLower(err.Error())
