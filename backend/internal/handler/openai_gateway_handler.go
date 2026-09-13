@@ -626,6 +626,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	var passthroughFailoverState openAIPassthroughFailoverState
 	selectionRetryCount := 0
+	// Set after a failed single-account upstream attempt is put back into the
+	// candidate set. This survives clearing failedAccountIDs below so the next
+	// selection failure keeps the short same-account cadence.
+	singleAccountRetryMode := false
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -690,7 +694,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					// longer than the client request budget and cannot be bypassed by
 					// another account in this path.
 					var delay time.Duration
-					if len(failedAccountIDs) == 1 {
+					if singleAccountRetryMode || len(failedAccountIDs) == 1 {
 						delay = accountSelectionWaitForSingleAccount(selectionRetryCount - 1)
 					} else {
 						delay = accountSelectionWaitFor(cooldown, selectionRetryCount-1)
@@ -733,6 +737,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					return
 				}
 				failedAccountIDs = make(map[int64]struct{})
+				singleAccountRetryMode = true
 				continue
 			}
 			if lastFailoverErr != nil {
@@ -751,6 +756,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 			return
 		}
+		singleAccountRetryMode = false
 		if previousResponseID != "" && selection != nil && selection.Account != nil {
 			reqLog.Debug("openai.account_selected_with_previous_response_id", zap.Int64("account_id", selection.Account.ID))
 		}
