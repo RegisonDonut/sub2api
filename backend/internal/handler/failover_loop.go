@@ -56,6 +56,9 @@ const (
 	// singleAccountRateLimitRetryAttempts is deliberately request-scoped: it
 	// never changes the persisted/global model cooldown used by other traffic.
 	singleAccountRateLimitRetryAttempts = 20
+	// clashEgressSameAccountRetryAttempts bounds IP-authorization recovery while
+	// still allowing a request to traverse a larger local egress pool.
+	clashEgressSameAccountRetryAttempts = 20
 	// maxProfitVetoAttempts 单次请求内允许的分组利润门终检否决次数上限。
 	// 利润否决不产生上游请求，因此不会推进 SwitchCount；没有独立上限的话，
 	// 「选号 → 终检否决 → 重选」在候选池与账号快照短暂不一致时可以空转很久。

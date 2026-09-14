@@ -86,6 +86,7 @@ type Config struct {
 	GoogleOAuth             EmailOAuthProviderConfig      `mapstructure:"google_oauth"`
 	Default                 DefaultConfig                 `mapstructure:"default"`
 	RateLimit               RateLimitConfig               `mapstructure:"rate_limit"`
+	ClashEgress             ClashEgressConfig             `mapstructure:"clash_egress"`
 	Pricing                 PricingConfig                 `mapstructure:"pricing"`
 	Gateway                 GatewayConfig                 `mapstructure:"gateway"`
 	APIKeyAuth              APIKeyAuthCacheConfig         `mapstructure:"api_key_auth_cache"`
@@ -1675,6 +1676,17 @@ type RateLimitConfig struct {
 	OAuth401CooldownMinutes int `mapstructure:"oauth_401_cooldown_minutes"` // OAuth 401临时不可调度冷却(分钟)
 }
 
+// ClashEgressConfig controls optional per-account egress rotation through a
+// local Clash/Mihomo controller. The controller secret is supplied at runtime.
+type ClashEgressConfig struct {
+	Enabled            bool   `mapstructure:"enabled"`
+	ControllerURL      string `mapstructure:"controller_url"`
+	Secret             string `mapstructure:"secret"`
+	SecretFile         string `mapstructure:"secret_file"`
+	ManagedProxyPrefix string `mapstructure:"managed_proxy_prefix"`
+	SelectorPrefix     string `mapstructure:"selector_prefix"`
+}
+
 // APIKeyAuthCacheConfig API Key 认证缓存配置
 type APIKeyAuthCacheConfig struct {
 	L1Size             int                    `mapstructure:"l1_size"`
@@ -2287,6 +2299,12 @@ func setDefaults() {
 	// RateLimit
 	viper.SetDefault("rate_limit.overload_cooldown_minutes", 10)
 	viper.SetDefault("rate_limit.oauth_401_cooldown_minutes", 10)
+	viper.SetDefault("clash_egress.enabled", false)
+	viper.SetDefault("clash_egress.controller_url", "http://host.docker.internal:9097")
+	viper.SetDefault("clash_egress.secret", "")
+	viper.SetDefault("clash_egress.secret_file", "")
+	viper.SetDefault("clash_egress.managed_proxy_prefix", "clash-openai-slot-")
+	viper.SetDefault("clash_egress.selector_prefix", "sub2api-openai-slot-")
 
 	// Pricing - 从 model-price-repo main 分支同步模型定价和上下文窗口数据
 	viper.SetDefault("pricing.remote_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json")

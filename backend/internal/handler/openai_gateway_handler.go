@@ -965,6 +965,22 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					// The service already moved this account's dedicated Clash
+					// selector. Retry the same account so it keeps its new IP binding.
+					if failoverErr.Reason == service.OpenAIClashEgressRotatedReason &&
+						sameAccountRetryCount[account.ID] < clashEgressSameAccountRetryAttempts {
+						sameAccountRetryCount[account.ID]++
+						reqLog.Warn("openai.clash_egress_same_account_retry",
+							zap.Int64("account_id", account.ID),
+							zap.Int("retry_count", sameAccountRetryCount[account.ID]),
+							zap.Int("retry_limit", clashEgressSameAccountRetryAttempts),
+							zap.Duration("retry_delay", sameAccountRetryDelay),
+						)
+						if !sleepWithContext(c.Request.Context(), sameAccountRetryDelay) {
+							return
+						}
+						continue
+					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)

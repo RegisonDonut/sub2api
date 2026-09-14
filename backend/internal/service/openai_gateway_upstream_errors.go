@@ -388,6 +388,16 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
 		upstreamMsg,
 		retryableOnSameAccount || oauth429Retry,
 	)
+	if account != nil && isOpenAIIPAuthorizationError(responseBody) && s != nil && s.clashEgress != nil && s.clashEgress.ConsumeRecentRotation(account.ID) {
+		failoverErr.RetryableOnSameAccount = true
+		failoverErr.RequestScopedTransient = true
+		failoverErr.Stage = GatewayFailureStageInference
+		failoverErr.Scope = GatewayFailureScopeAccount
+		failoverErr.Reason = OpenAIClashEgressRotatedReason
+		failoverErr.NextAccountAction = NextAccountRetry
+		failoverErr.ClientStatusCode = http.StatusBadGateway
+		failoverErr.ClientMessage = "OpenAI egress IP was rejected; retrying through a different route"
+	}
 	if oauth429Retry {
 		failoverErr.SameAccountRetryDeadline = s.openAIOAuth429RetryDeadline(account)
 		failoverErr.SameAccountRetryDelay = openAIOAuth429SameAccountRetryDelay(responseHeaders, failoverErr.SameAccountRetryDeadline)
@@ -400,10 +410,23 @@ const (
 	// OpenAIUpstreamAccessStateReason marks a provider credential whose
 	// account, workspace, or organization is unavailable.
 	OpenAIUpstreamAccessStateReason = GatewayFailureReason("openai_upstream_access_state")
+	// OpenAIClashEgressRotatedReason marks an IP authorization failure for which
+	// the local Clash controller selected a different egress node.
+	OpenAIClashEgressRotatedReason = GatewayFailureReason("clash_egress_rotated")
 	// OpenAIHTTPContinuationUnsupportedReason identifies accounts that cannot
 	// preserve an official Responses HTTP continuation without dropping state.
 	OpenAIHTTPContinuationUnsupportedReason = GatewayFailureReason("openai_http_continuation_unsupported")
 )
+
+func isOpenAIIPAuthorizationError(body []byte) bool {
+	message := strings.ToLower(strings.TrimSpace(extractUpstreamErrorMessage(body)))
+	if message == "" {
+		message = strings.ToLower(string(body))
+	}
+	return strings.Contains(message, "your ip is not authorized") ||
+		strings.Contains(message, "ip address is not authorized") ||
+		strings.Contains(message, "unauthorized ip address")
+}
 
 // isOpenAIUpstreamAccessStateError recognizes provider-side credential state
 // failures only from explicit structured codes. Free-form messages may contain

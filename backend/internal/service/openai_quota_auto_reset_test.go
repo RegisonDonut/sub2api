@@ -57,7 +57,9 @@ func TestAllOpenAIQuotaExhausted(t *testing.T) {
 	require.False(t, allOpenAIQuotaExhausted(nil, now))
 	require.True(t, allOpenAIQuotaExhausted([]Account{account(100, 100), account(100, 100)}, now))
 	require.False(t, allOpenAIQuotaExhausted([]Account{account(100, 100), account(99, 99)}, now))
-	require.False(t, allOpenAIQuotaExhausted([]Account{account(100, 0)}, now))
+	// Either quota window can independently block the account. A fully consumed
+	// 5h window must therefore trigger pool recovery even when 7d usage is low.
+	require.True(t, allOpenAIQuotaExhausted([]Account{account(100, 0)}, now))
 }
 
 func TestShouldAutoPauseOpenAIAccountByQuota_AutoResetCreditStates(t *testing.T) {

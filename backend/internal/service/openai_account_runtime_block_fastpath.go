@@ -107,6 +107,15 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
+	// This rejection describes the current egress, not the credential. A
+	// managed Clash slot can move the account to another node, so keep the
+	// account schedulable for an immediate same-account retry.
+	if account != nil && account.Platform == PlatformOpenAI && isOpenAIIPAuthorizationError(responseBody) {
+		if s != nil && s.clashEgress != nil && s.clashEgress.RotateAccount(ctx, account) {
+			slog.Warn("openai_clash_egress_rotated", "proxy", account.Proxy.Name)
+			return false
+		}
+	}
 	if account != nil && account.Platform == PlatformOpenAI && isOpenAIHTTPUpstreamAccessStateError(statusCode, "", responseBody) {
 		message := "OpenAI upstream account or workspace is unavailable"
 		if upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(responseBody)); upstreamMsg != "" {

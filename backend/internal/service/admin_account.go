@@ -527,6 +527,15 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err != nil {
 		return nil, err
 	}
+	if s.cfg != nil && s.cfg.ClashEgress.Enabled {
+		manager := newClashEgressManager(s.cfg)
+		if manager == nil {
+			return nil, errClashEgressUnavailable
+		}
+		if err := manager.assignManagedProxy(ctx, s.proxyRepo, account); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.ValidateAccountGroupBindings(ctx, groupIDs); err != nil {
 		return nil, err
 	}
